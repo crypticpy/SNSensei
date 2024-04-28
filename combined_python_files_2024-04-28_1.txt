@@ -1,0 +1,685 @@
+Content Map:
+analyzer.py: Starts at line 1
+config.py: Starts at line 180
+main.py: Starts at line 234
+menu.py: Starts at line 381
+preprocessor.py: Starts at line 465
+prompts.py: Starts at line 513
+utils.py: Starts at line 626
+Filename: analyzer.py
+--------------------------------
+import json
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple
+
+from openai import OpenAI
+from requests.exceptions import HTTPError
+from tqdm import tqdm
+
+from preprocessor import preprocess_ticket
+from prompts import generate_prompt
+
+logger = logging.getLogger(__name__)
+
+
+class TicketAnalyzer:
+    def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float, max_retries: int = 5,
+                 initial_delay: float = 1.0, backoff_factor: float = 2.0, initial_batch_size: int = 10,
+                 max_batch_size: int = 100, batch_size_factor: float = 2.0):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.max_retries = max_retries
+        self.initial_delay = initial_delay
+        self.backoff_factor = backoff_factor
+        self.initial_batch_size = initial_batch_size
+        self.max_batch_size = max_batch_size
+        self.batch_size_factor = batch_size_factor
+        self.num_workers = 1
+
+    @staticmethod
+    def postprocess_output(output: str, analysis_types: List[str]) -> Dict:
+        try:
+            output = output.strip().replace('\n', '').replace('\r', '')
+            analyzed_data = json.loads(output)
+
+            result = {}
+
+            if "extract_product" in analysis_types:
+                product = analyzed_data.get("product", "").strip()
+                result["product"] = product if product and product.lower() != "n/a" else ""
+                result["product_explanation"] = analyzed_data.get("product_explanation", "").strip()
+
+            if "summarize_ticket" in analysis_types:
+                summary = analyzed_data.get("summary", "").strip()
+                result["summary"] = summary if summary else ""
+                result["summary_explanation"] = analyzed_data.get("summary_explanation", "").strip()
+
+            if "resolution_appropriateness" in analysis_types:
+                resolution_appropriate = analyzed_data.get("resolution_appropriate", "N/A")
+                result["resolution_appropriate"] = resolution_appropriate
+                result["resolution_explanation"] = analyzed_data.get("resolution_explanation", "").strip()
+
+            if "ticket_quality" in analysis_types:
+                ticket_quality = analyzed_data.get("ticket_quality", "").strip().lower()
+                result["ticket_quality"] = ticket_quality if ticket_quality in ["good", "fair", "poor"] else ""
+                result["quality_explanation"] = analyzed_data.get("quality_explanation", "").strip()
+
+            if "sentiment_analysis" in analysis_types:
+                sentiment = analyzed_data.get("sentiment", "").strip().lower()
+                result["sentiment"] = sentiment if sentiment in ["positive", "negative", "neutral", "n/a"] else ""
+                result["sentiment_explanation"] = analyzed_data.get("sentiment_explanation", "").strip()
+
+            # Capture any excess or unexpected response
+            excess_response = {key: value for key, value in analyzed_data.items() if key not in result}
+            if excess_response:
+                result["excess_response"] = excess_response
+
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM output as JSON: {str(e)}\nOutput: {output}")
+            return {analysis_type: "" for analysis_type in analysis_types}
+
+    def analyze_ticket(self, ticket: Dict, columns: List[str], tracking_index_column: str, analysis_types: List[str]) -> \
+            Tuple[Dict, str, Dict]:
+        """Analyzes a single ticket using OpenAI API."""
+        preprocessed_ticket = preprocess_ticket(ticket, columns, tracking_index_column)
+        prompt = generate_prompt(preprocessed_ticket, columns, analysis_types)
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that analyzes help desk tickets and always responds in the proper json format."},
+            {"role": "user", "content": prompt}
+        ]
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature
+                )
+                output = response.choices[0].message.content.strip()
+                analyzed_ticket = self.postprocess_output(output, analysis_types)
+                return preprocessed_ticket, output, analyzed_ticket
+            except HTTPError as e:
+                if e.response.status_code in [429, 503]:
+                    wait_time = self.initial_delay * (self.backoff_factor ** attempt)
+                    logger.warning(
+                        f"API rate limit or server error encountered. Waiting for {wait_time} seconds before retrying...")
+                    time.sleep(wait_time)
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"Failed to analyze ticket: {str(e)}")
+                return preprocessed_ticket, "", {}
+            finally:
+                time.sleep(1)  # Throttle requests
+
+    def analyze_tickets(self, tickets: List[Dict], columns: List[str], tracking_index_column: str,
+                        analysis_types: List[str], max_workers: int = 50):
+        analyzed_tickets = []
+        num_workers = min(max_workers, len(tickets), self.initial_batch_size)
+        batch_size = self.initial_batch_size
+        error_count = 0
+        total_tickets = len(tickets)
+        max_batch_size = min(self.max_batch_size, len(tickets))
+        self.num_workers = num_workers
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = []
+            start_time = time.time()
+            with tqdm(total=total_tickets, desc="Analyzing Tickets", unit="ticket") as progress_bar:
+                for ticket in tickets:
+                    future = executor.submit(self.analyze_ticket, ticket, columns, tracking_index_column,
+                                             analysis_types)
+                    futures.append(future)
+                    if len(futures) >= batch_size:
+                        batch_start_time = time.time()
+                        for future in as_completed(futures):
+                            try:
+                                preprocessed_ticket, raw_response, analyzed_ticket = future.result()
+                                analyzed_tickets.append((preprocessed_ticket, raw_response, analyzed_ticket))
+                                progress_bar.update(1)
+                            except Exception as exc:
+                                logger.error(f'Ticket analysis generated an exception: {str(exc)}')
+                                error_count += 1
+                                progress_bar.update(1)
+                        batch_end_time = time.time()
+                        batch_execution_time = batch_end_time - batch_start_time
+
+                        if error_count == 0:
+                            if batch_execution_time < 30.0 and batch_size < max_batch_size:
+                                batch_size = min(int(batch_size * self.batch_size_factor), max_batch_size)
+                                num_workers = min(num_workers + 1, batch_size, max_workers)
+                            elif batch_execution_time > 30.0:
+                                batch_size = max(int(batch_size / self.batch_size_factor), self.initial_batch_size)
+                                num_workers = max(num_workers - 1, 1)
+                        else:
+                            batch_size = max(int(batch_size / self.batch_size_factor), self.initial_batch_size)
+                            num_workers = max(num_workers - 1, 1)
+
+                        logger.info(f"Batch completed. Batch size: {batch_size}, Workers: {num_workers}")
+                        yield analyzed_tickets
+                        analyzed_tickets = []
+                        futures = []
+                        error_count = 0
+
+                if futures:
+                    for future in as_completed(futures):
+                        try:
+                            preprocessed_ticket, raw_response, analyzed_ticket = future.result()
+                            analyzed_tickets.append((preprocessed_ticket, raw_response, analyzed_ticket))
+                            progress_bar.update(1)
+                        except Exception as exc:
+                            logger.error(f'Ticket analysis generated an exception: {str(exc)}')
+                            progress_bar.update(1)
+                    yield analyzed_tickets
+
+            end_time = time.time()
+            total_execution_time = end_time - start_time
+            logger.info(f"All tickets processed. Total execution time: {total_execution_time:.2f} seconds, "
+                        f"Average throughput: {total_tickets / total_execution_time:.2f} tickets/second")
+
+Filename: config.py
+--------------------------------
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
+
+def get_config():
+    """Returns the configuration for the application."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    azure_api_key = os.getenv("AZURE_API_KEY")
+
+    if azure_api_key:
+        # Use Azure configuration if available
+        config = {
+            "api_type": "azure",
+            "api_key": azure_api_key,
+            "api_base": "https://your_azure_api_base_url/",
+            "deployment_name": "your_azure_deployment_name",
+            "model": "your_azure_model_name",
+            "max_tokens": 100,
+            "temperature": 0.1,
+            "batch_size": 100,
+            "initial_batch_size": 10,
+            "max_batch_size": 100,
+            "batch_size_factor": 2.0,
+            "max_workers": 50,  # Number of concurrent workers for parallel processing
+            "output_file_prefix": "processed_tickets",
+            "include_raw_response": True,
+        }
+    elif api_key:
+        # Use OpenAI configuration
+        config = {
+            "api_type": "openai",
+            "api_key": api_key,
+            "model": "gpt-3.5-turbo-0125",  # Update the model to "gpt-4" for better performance
+            "max_tokens": 100,
+            "temperature": 0.1,
+            "batch_size": 100,
+            "initial_batch_size": 10,
+            "max_batch_size": 100,
+            "batch_size_factor": 2.0,
+            "max_workers": 50,  # Number of concurrent workers for parallel processing
+            "output_file_prefix": "processed_tickets",
+            "include_raw_response": True,
+        }
+    else:
+        raise ValueError("No valid API key found in the environment variables.")
+
+    config["log_level"] = "INFO"
+    config["log_format"] = "%(asctime)s - %(levelname)s - %(message)s"
+
+    return config
+Filename: main.py
+--------------------------------
+import logging
+import os
+import sys
+from datetime import datetime
+from threading import Lock
+from typing import Any
+
+import colorama
+import pandas as pd
+from tqdm import tqdm
+
+from analyzer import TicketAnalyzer
+from config import get_config
+from menu import select_columns, select_analysis_types
+from utils import get_versioned_filename, read_input_file
+
+
+def setup_logging(config):
+    log_level = config["log_level"]
+    log_format = config["log_format"]
+
+    # Create a logger for the application
+    logger = logging.getLogger("ticket_analyzer")
+    logger.setLevel(log_level)
+
+    # Create a logger for OpenAI API requests
+    openai_logger = logging.getLogger("openai")
+    openai_logger.setLevel(logging.DEBUG)
+
+    # Create file handlers and set the log levels
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    info_file_handler = logging.FileHandler(f"info_{timestamp}.log")
+    info_file_handler.setLevel(logging.INFO)
+    error_file_handler = logging.FileHandler(f"error_{timestamp}.log")
+    error_file_handler.setLevel(logging.ERROR)
+
+    # Create a console handler and set the log level
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+
+    # Create a formatter and add it to the handlers
+    formatter = logging.Formatter(log_format)
+    info_file_handler.setFormatter(formatter)
+    error_file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    # Add the handlers to the loggers
+    logger.addHandler(info_file_handler)
+    logger.addHandler(error_file_handler)
+    logger.addHandler(console_handler)
+    openai_logger.addHandler(info_file_handler)
+
+    return logger
+
+
+def main():
+    colorama.init()
+
+    try:
+        # Read configuration from environment variables or a configuration file
+        config = get_config()
+        api_key = config["api_key"]
+        model = config["model"]
+        max_tokens = config["max_tokens"]
+        temperature = config["temperature"]
+        batch_size = config["batch_size"]
+        initial_batch_size = config["initial_batch_size"]
+        max_batch_size = config["max_batch_size"]
+        batch_size_factor = config["batch_size_factor"]
+        max_workers = config["max_workers"]
+        output_file_prefix = config["output_file_prefix"]
+        include_raw_response = config["include_raw_response"]
+
+        logger = setup_logging(config)
+        logger.info("Configuration loaded successfully.")
+
+        # Read the input file
+        df = read_input_file()
+        total_tickets = len(df)
+        logger.info(f"Input file loaded successfully. Total tickets: {total_tickets}")
+
+        # Prompt the user to select columns for analysis and tracking index
+        columns: list[Any] = list(df.columns)
+        selected_columns, tracking_index_column = select_columns(columns, df)
+        logger.info(f"Selected columns: {', '.join(selected_columns)}")
+        logger.info(f"Tracking index column: {tracking_index_column}")
+
+        # Prompt the user to select analysis types
+        selected_analysis_types = select_analysis_types()
+
+        # Initialize the ticket analyzer
+        analyzer = TicketAnalyzer(api_key, model, max_tokens, temperature, initial_batch_size=initial_batch_size,
+                                  max_batch_size=max_batch_size, batch_size_factor=batch_size_factor)
+
+        # Process tickets in batches
+        processed_tickets = []
+        output_file = get_versioned_filename(output_file_prefix)
+
+        tickets = df.to_dict("records")
+
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = 80  # Default terminal width if not available
+
+        progress_bar = tqdm(total=total_tickets, desc="Analyzing Tickets", unit="ticket",
+                            ncols=terminal_width, miniters=1, dynamic_ncols=True)
+
+        batch_number = 0
+        total_processed = 0
+        total_errors = 0
+        total_recoveries = 0
+
+        for batch in analyzer.analyze_tickets(tickets, selected_columns, tracking_index_column,
+                                              selected_analysis_types, max_workers):
+            batch_number += 1
+            batch_size = len(batch)
+            total_processed += batch_size
+
+            batch_errors = sum(1 for _, _, analyzed_ticket in batch if not analyzed_ticket)
+            batch_recoveries = sum(1 for _, _, analyzed_ticket in batch if analyzed_ticket and batch_errors > 0)
+
+            total_errors += batch_errors
+            total_recoveries += batch_recoveries
+
+            progress_bar.set_postfix(
+                batch=f"{batch_number}/{total_tickets // analyzer.initial_batch_size + 1}",
+                processed=f"{total_processed}/{total_tickets}",
+                errors=total_errors,
+                recoveries=total_recoveries,
+                workers=analyzer.num_workers
+            )
+            progress_bar.update(batch_size)
+
+            # Append the processed tickets to the output CSV file
+            df_processed = pd.DataFrame(batch)
+            df_processed.to_csv(output_file, mode="a", header=not os.path.exists(output_file), index=False)
+
+    except Exception as e:
+        logger.exception(f"An error occurred: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
+Filename: menu.py
+--------------------------------
+import pandas as pd
+from colorama import Fore, Style
+
+
+def display_menu_options(options: list[str]) -> None:
+    for i, option in enumerate(options, start=1):
+        print(f"{Fore.BLUE}{i}. {option}{Style.RESET_ALL}")
+
+
+def get_user_selection(prompt: str, options: list[str]) -> list[str]:
+    selected_options = []
+    while True:
+        indices = input(f"\n{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
+        indices = [int(index.strip()) - 1 for index in indices.split(',')]
+        selected_options = [options[index] for index in indices if 0 <= index < len(options)]
+
+        print(f"\n{Fore.CYAN}Selected options: {', '.join(selected_options)}{Style.RESET_ALL}")
+        confirmation = input(f"{Fore.GREEN}Are these the correct options? (Y/N): {Style.RESET_ALL}")
+        if confirmation.upper() == 'Y':
+            break
+        elif confirmation.upper() == 'N':
+            selected_options = []
+        else:
+            print(f"{Fore.RED}Invalid input. Please enter Y or N.{Style.RESET_ALL}")
+
+    return selected_options
+
+
+def select_columns(columns: list[str], df: pd.DataFrame) -> tuple[list[str], str]:
+    print(f"{Fore.CYAN}Available columns:{Style.RESET_ALL}")
+    display_menu_options(columns)
+
+    selected_columns = get_user_selection(
+        "Select the columns you want to use for analysis (comma-separated): ", columns)
+
+    # Validate selected columns against DataFrame columns
+    invalid_columns = set(selected_columns) - set(df.columns)
+    while invalid_columns:
+        print(f"\n{Fore.RED}Invalid column(s) selected: {', '.join(invalid_columns)}{Style.RESET_ALL}")
+        print("Please select valid columns from the available options.")
+        selected_columns = get_user_selection(
+            "Select the columns you want to use for analysis (comma-separated): ", columns)
+        invalid_columns = set(selected_columns) - set(df.columns)
+
+    tracking_index_column = None
+    while True:
+        tracking_index = input(
+            f"\n{Fore.YELLOW}Select the column to use as the tracking index (or leave blank if not required): {Style.RESET_ALL}")
+        if tracking_index.strip() == "":
+            break
+        try:
+            index = int(tracking_index.strip()) - 1
+            if 0 <= index < len(columns):
+                tracking_index_column = columns[index]
+
+                # Validate tracking index column against DataFrame columns
+                if tracking_index_column not in df.columns:
+                    print(
+                        f"\n{Fore.RED}Invalid tracking index column selected: {tracking_index_column}{Style.RESET_ALL}")
+                    print("Please select a valid column from the available options.")
+                    continue
+
+                break
+            else:
+                print(f"{Fore.RED}Invalid tracking index: {index + 1}. Please try again.{Style.RESET_ALL}")
+        except ValueError:
+            print(f"{Fore.RED}Invalid input. Please enter a valid tracking index.{Style.RESET_ALL}")
+
+    return selected_columns, tracking_index_column
+
+
+def select_analysis_types() -> list[str]:
+    analysis_types = ["extract_product", "summarize_ticket", "resolution_appropriateness", "ticket_quality",
+                      "sentiment_analysis"]
+    print(f"{Fore.CYAN}Available analysis types:{Style.RESET_ALL}")
+    display_menu_options(analysis_types)
+
+    selected_analysis_types = get_user_selection(
+        "Select the analysis types you want to perform (comma-separated): ", analysis_types)
+
+    return selected_analysis_types
+
+Filename: preprocessor.py
+--------------------------------
+import re
+from typing import Dict, List, Optional
+
+import pandas as pd
+
+
+def remove_sensitive_info(text: str) -> str:
+    """Removes sensitive information like IP addresses and phone numbers from the text."""
+    text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '', text)  # IP addresses
+    text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '', text)  # US phone numbers
+    return text
+
+
+def strip_email_signatures_and_links(text: str) -> str:
+    """Strips email signatures, image paths, and hyperlinks from the text."""
+    text = re.split(r'(--|_____)', text, maxsplit=1)[0].strip()
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)  # Markdown images
+    text = re.sub(r'\[.*?\]\(.*?\)', '', text)  # Markdown links
+    text = re.sub(r'<img[^>]*>', '', text)  # HTML images
+    text = re.sub(r'<a[^>]*>.*?</a>', '', text)  # HTML links
+    return text
+
+
+def preprocess_text(text: str) -> str:
+    """Applies both sensitive info removal and signature/link stripping to the text."""
+    text = remove_sensitive_info(text)
+    text = strip_email_signatures_and_links(text)
+    return text
+
+
+def preprocess_ticket(ticket: Dict, columns: List[str], tracking_index_column: Optional[str] = None) -> Dict:
+    preprocessed_ticket = {}
+    for column in columns:
+        if column in ticket:
+            value = ticket[column]
+            if pd.notna(value) and value != "":
+                if isinstance(value, str):
+                    preprocessed_ticket[column] = preprocess_text(value)
+                else:
+                    preprocessed_ticket[column] = str(value)
+    if tracking_index_column and tracking_index_column in ticket:
+        tracking_index_value = ticket[tracking_index_column]
+        if pd.notna(tracking_index_value) and tracking_index_value != "":
+            preprocessed_ticket["tracking_index"] = str(tracking_index_value)
+    return preprocessed_ticket
+
+Filename: prompts.py
+--------------------------------
+from typing import Optional
+
+def generate_prompt(ticket: dict, columns: list, analysis_types: list, tracking_index_column: Optional[str] = None) -> str:
+    """Generates the prompt for the LLM based on the ticket, selected columns, and analysis types."""
+    ticket_info = "\n".join([f"{column}: {ticket[column]}" for column in columns if column in ticket])
+
+    if not ticket_info:
+        ticket_info = "No information available for the selected columns."
+
+    main_prompt = f"IMPORTANT: Please provide your response in a complete and well-formatted JSON format as specified below.\n\nAnalyze the following trouble ticket information:\n\n{ticket_info}\n\n"
+
+    analysis_instructions = []
+
+
+    analysis_instructions = []
+
+    if "extract_product" in analysis_types:
+        analysis_instructions.append(
+            "Extract the product or system mentioned in the ticket. "
+            "The product could be a software (e.g., MS Word, Outlook), hardware brand or type (e.g., Toshiba Laptop, Printer), "
+            "or a general category (e.g., Word Processor, Email). "
+            "If no specific product is mentioned, try to provide a general category or type. "
+            "If no product or category can be determined, respond with 'N/A'."
+        )
+
+    if "summarize_ticket" in analysis_types:
+        analysis_instructions.append(
+            "Provide a concise 2 to 5 word summary of the ticket. "
+            "The summary should capture the main issue or request described in the ticket."
+        )
+
+    if "resolution_appropriateness" in analysis_types:
+        analysis_instructions.append(
+            "Determine if the resolution provided was appropriate or not, based on the ticket description and resolution details. "
+            "Consider factors such as whether the resolution addresses the main issue, provides a clear solution, "
+            "and follows standard procedures or best practices."
+        )
+
+    if "ticket_quality" in analysis_types:
+        analysis_instructions.append(
+            "Determine the quality and completeness of the ticket description and incident details. "
+            "Classify the ticket quality as 'good', 'fair', or 'poor' based on the level of detail, clarity, and relevance of the information provided. "
+            "A 'good' ticket should have a clear and detailed description of the issue, steps to reproduce (if applicable), "
+            "and any relevant context or background information. "
+            "A 'fair' ticket may have some missing or unclear details but still provides enough information to understand the issue. "
+            "A 'poor' ticket lacks essential details, is unclear, or contains irrelevant information."
+        )
+
+    if "sentiment_analysis" in analysis_types:
+        analysis_instructions.append(
+            "Determine the sentiment expressed by the customer or user in the ticket. "
+            "Classify the sentiment as 'positive', 'negative', 'neutral', or 'N/A' if no clear sentiment can be determined. "
+            "Consider the tone, language, and overall expression in the ticket description and any additional comments. "
+            "A 'positive' sentiment may include expressions of gratitude, satisfaction, or positive feedback. "
+            "A 'negative' sentiment may include expressions of frustration, dissatisfaction, or criticism. "
+            "A 'neutral' sentiment is present when the tone is factual, impartial, or lacks strong emotional indicators."
+        )
+
+    main_prompt += "Please perform the following analysis:\n" + "\n".join(
+        f"{i + 1}. {instruction}" for i, instruction in enumerate(analysis_instructions))
+
+    main_prompt += "\n\nIf the information provided in the ticket is insufficient to perform any of the requested analyses, respond with 'N/A' for that specific analysis."
+
+    main_prompt += "\n\nExample of a well-formatted JSON response:\n"
+    main_prompt += """{
+          "product": "Email",
+          "product_explanation": "The ticket mentions issues with accessing email, indicating the product is related to the email system.",
+          "summary": "Unable to access email",
+          "summary_explanation": "The main issue is that the user cannot access their email account.",
+          "resolution_appropriate": true,
+          "resolution_explanation": "The resolution steps provided, such as checking network connection and verifying login credentials, are appropriate troubleshooting steps for email access issues.",
+          "ticket_quality": "good",
+          "quality_explanation": "The ticket provides clear details about the issue and the steps already taken by the user.",
+          "sentiment": "neutral",
+          "sentiment_explanation": "The user's tone is neutral and factual, focusing on describing the issue without expressing strong emotions."
+        }"""
+
+    main_prompt += "\n\nIf you encounter any issues generating a complete JSON response for a specific analysis type, please provide a default response for that analysis type and include an error message indicating the issue."
+
+    main_prompt += "\n\nMake sure to provide a brief but informative explanation for your response to each analysis type, enclosed in double quotes."
+
+    # Start JSON output format.
+    main_prompt += "\n\nProvide your response in the following JSON format:\n{"
+    json_elements = []
+    if tracking_index_column:
+        json_elements.append(f'  "tracking_index": "{ticket.get(tracking_index_column, "")}"')
+
+    # Generate JSON output properties for each analysis type.
+    analysis_properties = []
+    if "extract_product" in analysis_types:
+        analysis_properties.append('  "product": "<extracted_product>",\n  "product_explanation": "<explanation>"')
+    if "summarize_ticket" in analysis_types:
+        analysis_properties.append('  "summary": "<ticket_summary>",\n  "summary_explanation": "<explanation>"')
+    if "resolution_appropriateness" in analysis_types:
+        analysis_properties.append(
+            '  "resolution_appropriate": <true|false|"N/A">,\n  "resolution_explanation": "<explanation>"')
+    if "ticket_quality" in analysis_types:
+        analysis_properties.append('  "ticket_quality": "<good|fair|poor>",\n  "quality_explanation": "<explanation>"')
+    if "sentiment_analysis" in analysis_types:
+        analysis_properties.append(
+            '  "sentiment": "<positive|negative|neutral|N/A>",\n  "sentiment_explanation": "<explanation>"')
+
+    # Concatenate JSON properties, handling commas correctly.
+    if analysis_properties:
+        json_elements.extend(analysis_properties)
+
+    main_prompt += ",\n".join(json_elements)
+    main_prompt += "\n}"
+
+    return main_prompt
+
+Filename: utils.py
+--------------------------------
+import os
+from datetime import datetime
+from typing import List
+
+import pandas as pd
+
+
+def get_versioned_filename(output_file_prefix: str) -> str:
+    """Generates a versioned filename based on the output file prefix."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    version = 1
+    output_file = f"{output_file_prefix}_{timestamp}_v{version}.csv"
+    while os.path.exists(output_file):
+        version += 1
+        output_file = f"{output_file_prefix}_{timestamp}_v{version}.csv"
+    return output_file
+
+
+def read_input_file() -> pd.DataFrame:
+    input_files = [file for file in os.listdir(".") if file.endswith((".csv", ".xlsx", ".xls"))]
+    if not input_files:
+        raise FileNotFoundError("No CSV or XLSX files found in the application directory.")
+
+    if len(input_files) == 1:
+        input_file = input_files[0]
+    else:
+        print("Available input files:")
+        for i, file in enumerate(input_files, start=1):
+            print(f"{i}. {file}")
+
+        while True:
+            file_index = input("Select the input file you want to use: ")
+            try:
+                index = int(file_index.strip()) - 1
+                if 0 <= index < len(input_files):
+                    input_file = input_files[index]
+                    break
+                else:
+                    print(f"Invalid file index: {index + 1}. Please try again.")
+            except ValueError:
+                print("Invalid input. Please enter a valid file index.")
+
+    if input_file.endswith(".csv"):
+        return pd.read_csv(input_file)
+    elif input_file.endswith((".xlsx", ".xls")):
+        return pd.read_excel(input_file)
+
+
+
+

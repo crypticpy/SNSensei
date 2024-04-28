@@ -1,0 +1,10 @@
+pandas~=2.2.2
+openai~=1.23.2
+python-dotenv~=1.0.1
+python-magic
+openpyxl
+libmagic
+requests~=2.31.0
+colorama~=0.4.6
+tenacity~=8.2.3
+rich~=13.7.1
