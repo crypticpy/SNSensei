@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple
@@ -7,11 +8,30 @@ from typing import List, Dict, Tuple
 from openai import OpenAI
 from requests.exceptions import HTTPError
 
-
-from preprocessor import preprocess_ticket
-from prompts import generate_prompt
+from app.preprocessor import preprocess_ticket
+from app.prompts import generate_prompt
 
 logger = logging.getLogger(__name__)
+
+
+class CircuitBreaker:
+    def __init__(self, max_failures: int, reset_timeout: int):
+        self.max_failures = max_failures
+        self.reset_timeout = reset_timeout
+        self.failures = 0
+        self.last_failure_time = 0
+
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure_time = time.time()
+
+    def is_open(self):
+        if self.failures >= self.max_failures:
+            if time.time() - self.last_failure_time < self.reset_timeout:
+                return True
+            else:
+                self.failures = 0
+        return False
 
 
 class TicketAnalyzer:
@@ -29,6 +49,7 @@ class TicketAnalyzer:
         self.max_batch_size = max_batch_size
         self.batch_size_factor = batch_size_factor
         self.num_workers = 1
+        self.circuit_breaker = CircuitBreaker(max_failures=5, reset_timeout=300)
 
     @staticmethod
     def postprocess_output(output: str, analysis_types: List[str]) -> Dict:
@@ -77,6 +98,10 @@ class TicketAnalyzer:
     def analyze_ticket(self, ticket: Dict, columns: List[str], tracking_index_column: str, analysis_types: List[str]) -> \
             Tuple[Dict, str, Dict]:
         """Analyzes a single ticket using OpenAI API."""
+        if self.circuit_breaker.is_open():
+            logger.error("Circuit breaker is open. Aborting retries.")
+            return {}, "", {}
+
         preprocessed_ticket = preprocess_ticket(ticket, columns, tracking_index_column)
         prompt = generate_prompt(preprocessed_ticket, columns, analysis_types)
 
@@ -99,67 +124,104 @@ class TicketAnalyzer:
             except HTTPError as e:
                 if e.response.status_code in [429, 503]:
                     wait_time = self.initial_delay * (self.backoff_factor ** attempt)
+                    wait_time += random.uniform(0, self.initial_delay)  # Adding jitter
                     logger.warning(
-                        f"API rate limit or server error encountered. Waiting for {wait_time} seconds before retrying...")
+                        f"API rate limit or server error encountered. Waiting for {wait_time:.2f} seconds before retrying...")
                     time.sleep(wait_time)
                 else:
+                    logger.error(f"HTTP error occurred: {str(e)}")
                     raise
             except Exception as e:
                 logger.error(f"Failed to analyze ticket: {str(e)}")
-                return preprocessed_ticket, "", {}
+                raise
             finally:
                 time.sleep(1)  # Throttle requests
 
+        logger.error(f"Max retries exceeded for ticket analysis.")
+        self.circuit_breaker.record_failure()
+        return preprocessed_ticket, "", {}
+
     def analyze_tickets(self, tickets: List[Dict], columns: List[str], tracking_index_column: str,
                         analysis_types: List[str], max_workers: int = 50):
-        analyzed_tickets = []
-        num_workers = min(max_workers, len(tickets), self.initial_batch_size)
+        num_workers = min(max_workers, self.initial_batch_size)
         batch_size = self.initial_batch_size
         error_count = 0
         total_tickets = len(tickets)
         max_batch_size = min(self.max_batch_size, len(tickets))
         self.num_workers = num_workers
+        processed_tickets = 0
+        capacity_messages = []
+
+        def process_batch(futures):
+            batch_start_time = time.time()
+            batch = []
+            batch_error_count = 0
+            batch_error_details = []
+            for future in as_completed(futures):
+                try:
+                    preprocessed_ticket, raw_response, analyzed_ticket = future.result()
+                    batch.append((preprocessed_ticket, raw_response, analyzed_ticket))
+                except Exception as exc:
+                    logger.error(f'Ticket analysis generated an exception: {str(exc)}')
+                    batch_error_count += 1
+                    batch_error_details.append(str(exc))
+            batch_end_time = time.time()
+            batch_execution_time = batch_end_time - batch_start_time
+            return batch, batch_error_count, batch_error_details, batch_execution_time
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = []
             for ticket in tickets:
+                if self.circuit_breaker.is_open():
+                    logger.error("Circuit breaker is open. Stopping ticket analysis.")
+                    break
+
                 future = executor.submit(self.analyze_ticket, ticket, columns, tracking_index_column,
                                          analysis_types)
                 futures.append(future)
                 if len(futures) >= batch_size:
-                    batch_start_time = time.time()
-                    for future in as_completed(futures):
-                        try:
-                            preprocessed_ticket, raw_response, analyzed_ticket = future.result()
-                            analyzed_tickets.append((preprocessed_ticket, raw_response, analyzed_ticket))
-                        except Exception as exc:
-                            logger.error(f'Ticket analysis generated an exception: {str(exc)}')
-                            error_count += 1
-                    batch_end_time = time.time()
-                    batch_execution_time = batch_end_time - batch_start_time
+                    batch, batch_error_count, batch_error_details, batch_execution_time = process_batch(futures)
+                    processed_tickets += len(batch)
+                    total_batches = total_tickets // batch_size + (1 if total_tickets % batch_size > 0 else 0)
+                    current_batch = (processed_tickets - 1) // batch_size + 1
 
-                    if error_count == 0:
-                        if batch_execution_time < 30.0 and batch_size < max_batch_size:
+                    logger.info(f"Batch execution time: {batch_execution_time:.2f} seconds")
+                    logger.info(f"Error count: {batch_error_count}")
+                    logger.info(f"Batch size: {batch_size}")
+                    logger.info(f"Number of workers: {num_workers}")
+                    logger.info(f"Current batch: {current_batch}/{total_batches}")
+
+                    error_count += batch_error_count
+
+                    if batch_error_count == 0:
+                        if batch_execution_time < 60.0 and batch_size < max_batch_size:
                             batch_size = min(int(batch_size * self.batch_size_factor), max_batch_size)
-                            num_workers = min(num_workers + 1, batch_size, max_workers)
-                        elif batch_execution_time > 30.0:
+                            num_workers = min(int(num_workers * self.batch_size_factor), batch_size, max_workers)
+                            if batch_size >= 100 and num_workers < 20:
+                                num_workers = min(20, batch_size, max_workers)
+                            total_batches = total_tickets // batch_size + (1 if total_tickets % batch_size > 0 else 0)
+                            capacity_messages.append(f"[bold green]Low error rate, increasing workers and batch size to {num_workers} and {batch_size} respectively.")
+                        elif batch_execution_time > 90.0 and batch_size > self.initial_batch_size:
                             batch_size = max(int(batch_size / self.batch_size_factor), self.initial_batch_size)
-                            num_workers = max(num_workers - 1, 1)
+                            num_workers = max(int(num_workers / self.batch_size_factor), 1)
+                            total_batches = total_tickets // batch_size + (1 if total_tickets % batch_size > 0 else 0)
+                            capacity_messages.append(f"[bold red]High error rate, decreasing workers and batch size to {num_workers} and {batch_size} respectively.")
                     else:
                         batch_size = max(int(batch_size / self.batch_size_factor), self.initial_batch_size)
-                        num_workers = max(num_workers - 1, 1)
+                        num_workers = max(int(num_workers / self.batch_size_factor), 1)
+                        total_batches = total_tickets // batch_size + (1 if total_tickets % batch_size > 0 else 0)
+                        capacity_messages.append(f"[bold red]High error rate, decreasing workers and batch size to {num_workers} and {batch_size} respectively.")
 
                     self.num_workers = num_workers
-                    yield analyzed_tickets, batch_size, num_workers
-                    analyzed_tickets = []
+                    yield batch, batch_size, num_workers, processed_tickets, total_batches, current_batch, batch_error_count, batch_execution_time, batch_error_details, capacity_messages
                     futures = []
-                    error_count = 0
 
             if futures:
-                for future in as_completed(futures):
-                    try:
-                        preprocessed_ticket, raw_response, analyzed_ticket = future.result()
-                        analyzed_tickets.append((preprocessed_ticket, raw_response, analyzed_ticket))
-                    except Exception as exc:
-                        logger.error(f'Ticket analysis generated an exception: {str(exc)}')
-                yield analyzed_tickets, batch_size, num_workers
+                batch, batch_error_count, batch_error_details, batch_execution_time = process_batch(futures)
+                processed_tickets += len(batch)
+                current_batch = (processed_tickets - 1) // batch_size + 1
+
+                error_count += batch_error_count
+
+                yield batch, batch_size, num_workers, processed_tickets, total_batches, current_batch, batch_error_count, batch_execution_time, batch_error_details, capacity_messages
+

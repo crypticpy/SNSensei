@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime
 
 
@@ -16,9 +17,12 @@ def setup_logging(config):
 
     # Create file handlers and set the log levels
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    info_file_handler = logging.FileHandler(f"info_{timestamp}.log")
+    os.makedirs("../logs", exist_ok=True)
+    info_file_handler = logging.FileHandler(f"../logs/info_{timestamp}.log")
     info_file_handler.setLevel(logging.INFO)
-    error_file_handler = logging.FileHandler(f"error_{timestamp}.log")
+    error_file_handler = logging.FileHandler(f"../logs/error_{timestamp}.log")
+
+    # Set the log level for the error file handler
     error_file_handler.setLevel(logging.ERROR)
 
     # Create a formatter and add it to the handlers

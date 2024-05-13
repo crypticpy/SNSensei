@@ -1,18 +1,17 @@
 import os
 from datetime import datetime
 
-
 import pandas as pd
 
 
 def get_versioned_filename(output_file_prefix: str) -> str:
-    """Generates a versioned filename based on the output file prefix."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     version = 1
-    output_file = f"{output_file_prefix}_{timestamp}_v{version}.csv"
+    os.makedirs("output", exist_ok=True)
+    output_file = f"output/{output_file_prefix}_{timestamp}_v{version}.csv"
     while os.path.exists(output_file):
         version += 1
-        output_file = f"{output_file_prefix}_{timestamp}_v{version}.csv"
+        output_file = f"output/{output_file_prefix}_{timestamp}_v{version}.csv"
     return output_file
 
 

@@ -1,5 +1,10 @@
 .venv/
 __pycache__/
 .idea/
+snapshots/
+output/
+logs/
 *.pyc
 .env
+*.csv
+*.sh
