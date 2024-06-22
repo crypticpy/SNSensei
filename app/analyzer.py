@@ -232,11 +232,3 @@ class AsyncTicketAnalyzer:
 if __name__ == "__main__":
     config = get_config()
     analyzer = AsyncTicketAnalyzer(config)
-
-    # You can add some test code here to verify the analyzer's functionality
-    # For example:
-    # test_ticket = {...}
-    # test_columns = [...]
-    # test_analysis_types = [...]
-    # result = asyncio.run(analyzer.analyze_ticket(test_ticket, test_columns, "id", test_analysis_types, True))
-    # print(result)
