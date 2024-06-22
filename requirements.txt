@@ -8,3 +8,7 @@ requests~=2.31.0
 colorama~=0.4.6
 tenacity~=8.2.3
 rich~=13.7.1
+aiohttp~=3.9.5
+streamlit~=1.35.0
+pytest~=8.2.2
+certifi~=2024.6.2

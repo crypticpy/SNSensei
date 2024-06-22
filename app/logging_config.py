@@ -1,38 +1,44 @@
 import logging
 import os
-from datetime import datetime
+from app.config import get_config
 
+def setup_logging():
+    config = get_config()
+    log_level = config.get('LOG_LEVEL', 'INFO')
+    log_format = config.get('LOG_FORMAT', '%(asctime)s - %(levelname)s - %(message)s')
 
-def setup_logging(config):
-    log_level = config["log_level"]
-    log_format = config["log_format"]
-
-    # Create a logger for the application
+    # Create a logger
     logger = logging.getLogger("ticket_analyzer")
     logger.setLevel(log_level)
 
-    # Create a logger for OpenAI API requests
-    openai_logger = logging.getLogger("openai")
-    openai_logger.setLevel(logging.DEBUG)
-
-    # Create file handlers and set the log levels
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs("../logs", exist_ok=True)
-    info_file_handler = logging.FileHandler(f"../logs/info_{timestamp}.log")
-    info_file_handler.setLevel(logging.INFO)
-    error_file_handler = logging.FileHandler(f"../logs/error_{timestamp}.log")
-
-    # Set the log level for the error file handler
-    error_file_handler.setLevel(logging.ERROR)
-
-    # Create a formatter and add it to the handlers
+    # Create formatter
     formatter = logging.Formatter(log_format)
-    info_file_handler.setFormatter(formatter)
-    error_file_handler.setFormatter(formatter)
 
-    # Add the handlers to the loggers
-    logger.addHandler(info_file_handler)
-    logger.addHandler(error_file_handler)
-    openai_logger.addHandler(info_file_handler)
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+
+    # File handler with rotation
+    log_directory = "logs"
+    os.makedirs(log_directory, exist_ok=True)
+    file_handler = logging.FileHandler(
+        filename=os.path.join(log_directory, "ticket_analyzer.log"),
+        encoding="utf-8"
+    )
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+
+    # Add handlers to the logger
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
 
     return logger
+
+# Example usage
+if __name__ == "__main__":
+    logger = setup_logging()
+    logger.debug("This is a debug message")
+    logger.info("This is an info message")
+    logger.warning("This is a warning message")
+    logger.error("This is an error message")

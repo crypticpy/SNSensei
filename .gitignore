@@ -8,3 +8,6 @@ logs/
 .env
 *.csv
 *.sh
+*.xlsx
+venv
+.venv2
